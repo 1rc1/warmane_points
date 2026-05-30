@@ -53,8 +53,9 @@ def get_account_page(session: requests.Session, name: str):
     meta = soup.find("meta", {"name": "csrf-token"})
     csrf = meta["content"] if meta else None
 
+    points_el = soup.find("span", class_="myPoints")
     log.info("[%s] Session valid (current points: %s)",
-             name, (soup.find("span", class_="myPoints") or {}).get_text(strip=True) or "?")
+             name, points_el.get_text(strip=True) if points_el else "?")
     return soup, csrf
 
 
