@@ -23,6 +23,10 @@ cd warmane_points
 4. In the right panel open **Request Headers**
 5. Find the `Cookie:` line and copy everything after `Cookie: `
 
+**For multiple accounts** — get each cookie without logging out:
+- Use a **private/incognito window** for the second account (separate session from your main browser)
+- Or use a second **browser profile** (each profile has its own independent session)
+
 ### 3. Create your `.env` file
 
 ```bash
