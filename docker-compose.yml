@@ -1,0 +1,16 @@
+services:
+  warmane-points:
+    build: .
+    container_name: warmane-points
+    env_file: .env
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+# .env should contain:
+#   WARMANE_USERNAME_1=account1
+#   WARMANE_PASSWORD_1=password1
+#   WARMANE_USERNAME_2=account2
+#   WARMANE_PASSWORD_2=password2

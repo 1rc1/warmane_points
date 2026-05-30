@@ -1,0 +1,2 @@
+# Collect Warmane daily points every day at 08:00 UTC
+0 23 * * * python /app/collect_points.py >> /proc/1/fd/1 2>&1
