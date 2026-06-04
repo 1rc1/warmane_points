@@ -112,7 +112,7 @@ def browser_login(name: str, username: str, password: str):
             page.fill("#userID", username)
             page.fill("#userPW", password)
 
-            # The form submits via AJAX; capture the login response for logging.
+            # The form submits via AJAX; wait for the login POST to complete.
             try:
                 with page.expect_response(
                     lambda r: "/account/login" in r.url
@@ -120,8 +120,13 @@ def browser_login(name: str, username: str, password: str):
                     timeout=60000,
                 ) as resp_info:
                     page.click("button[type=submit]")
-                body = resp_info.value.text()
-                log.info("[%s] Login response: %s", name, body[:200])
+                # Best-effort: log the response body. On a successful login the
+                # browser redirects and evicts the body, so reading it may fail
+                # — that's fine, it's only informational.
+                try:
+                    log.info("[%s] Login response: %s", name, resp_info.value.text()[:200])
+                except Exception:
+                    pass
             except PWTimeout:
                 log.error("[%s] Login request never completed", name)
                 return None, None, None
