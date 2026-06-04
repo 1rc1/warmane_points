@@ -26,16 +26,14 @@ cp .env.example .env
 Edit `.env` and fill in your accounts:
 
 ```env
-WARMANE_NAME_1=MyAccount
 WARMANE_USERNAME_1=myusername
 WARMANE_PASSWORD_1=mypassword
 
-WARMANE_NAME_2=AnotherAccount
 WARMANE_USERNAME_2=anotheruser
 WARMANE_PASSWORD_2=anotherpassword
 ```
 
-`WARMANE_NAME_N` is just a label for the logs (optional — defaults to the username). Supports up to 20 accounts; just keep adding numbered blocks.
+Supports up to 20 accounts; just keep adding numbered blocks. Optionally set `WARMANE_NAME_N` to label an account in the logs (defaults to the username).
 
 ### 3. Start the container
 
