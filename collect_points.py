@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Collect daily Warmane coinage points."""
+"""Collect daily Warmane coinage points.
+
+The Warmane login form is protected by an interactive Cloudflare Turnstile
+challenge ("Verify you are human"), so a plain HTTP login is rejected by the
+server. We drive a real (headed, under Xvfb) Chromium browser via patchright —
+a patched Playwright that evades automation detection — to fill the form, click
+the Turnstile checkbox, and obtain the token. Once logged in, the session
+cookies are handed to `requests` for the actual points collection.
+"""
 
 import os
 import sys
 import logging
+import tempfile
+
 import requests
 from bs4 import BeautifulSoup
+from patchright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,63 +27,153 @@ log = logging.getLogger(__name__)
 
 BASE = "https://www.warmane.com"
 ACCOUNT_URL = f"{BASE}/account"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-}
+LOGIN_URL = f"{BASE}/account/login"
+TURNSTILE_IFRAME = "iframe[src*='challenges.cloudflare.com']"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+HEADERS = {"User-Agent": USER_AGENT}
+
+# Headed by default — Turnstile only issues a token to a non-headless browser.
+# Requires an X display (the Docker image runs Xvfb; see entrypoint.sh).
+HEADLESS = os.environ.get("WARMANE_HEADLESS", "false").lower() == "true"
+# Max wait (ms) for Turnstile to issue its token after the checkbox is clicked.
+TURNSTILE_TIMEOUT = int(os.environ.get("WARMANE_TURNSTILE_TIMEOUT", "45000"))
+
+_TOKEN_READY_JS = (
+    "() => { const e = document.querySelector('[name=\"cf-turnstile-response\"]');"
+    " return e && e.value && e.value.length > 20; }"
+)
 
 
-def make_session(cookie_str: str) -> requests.Session:
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if "=" in part:
-            name, _, value = part.partition("=")
-            session.cookies.set(name.strip(), value.strip(), domain="www.warmane.com")
-    return session
+def _solve_turnstile(page, name: str, attempts: int = 3) -> bool:
+    """Load the login page and clear the interactive Turnstile challenge.
+
+    Clicks the "Verify you are human" checkbox inside the Cloudflare iframe and
+    waits for the token to land in the hidden form field. Turnstile is flaky,
+    so this reloads and retries a few times. Returns True once a token exists.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            # The widget needs a moment to initialise — clicking before its JS
+            # is ready registers on a dead widget and no token is ever issued.
+            # (Don't wait_for_selector on the iframe: Cloudflare's iframe is
+            # reported non-visible, so a visibility wait just burns the timeout.
+            # The frame_locator click below auto-waits for the checkbox itself.)
+            page.wait_for_timeout(6000)
+            page.frame_locator(TURNSTILE_IFRAME).locator(
+                "input[type=checkbox]"
+            ).click(timeout=15000)
+            page.wait_for_function(_TOKEN_READY_JS, timeout=TURNSTILE_TIMEOUT)
+            return True
+        except PWTimeout:
+            log.warning(
+                "[%s] Turnstile attempt %d/%d did not yield a token; retrying",
+                name, attempt, attempts,
+            )
+    log.error(
+        "[%s] Turnstile did not issue a token after %d attempts — the captcha "
+        "challenge failed (often IP reputation; try a residential network)",
+        name, attempts,
+    )
+    return False
 
 
-def get_account_page(session: requests.Session, name: str):
-    """Fetch the account page. Returns (soup, csrf_token) or exits on auth failure."""
-    r = session.get(ACCOUNT_URL)
-    r.raise_for_status()
+def browser_login(name: str, username: str, password: str):
+    """Log in through a real browser, solving the Turnstile challenge.
 
-    if "/account/login" in r.url:
-        log.error(
-            "[%s] Cookie expired — log into warmane.com, open DevTools → Network → "
-            "any request → Request Headers → copy the full Cookie value into .env",
-            name,
+    Returns (cookies, csrf, page_html) on success, or (None, None, None) on
+    failure. `cookies` is the list of Playwright cookie dicts for the
+    authenticated session.
+    """
+    with sync_playwright() as p, tempfile.TemporaryDirectory(prefix="wm-udd-") as udd:
+        # patchright works best with a persistent context + the real Chromium
+        # channel; that combination is what gets past Cloudflare's detection.
+        # NOTE: do not override user_agent or pass detectable args here.
+        # patchright relies on the browser's genuine fingerprint; a spoofed UA
+        # creates a mismatch that makes Cloudflare refuse to issue a token.
+        ctx = p.chromium.launch_persistent_context(
+            user_data_dir=udd,
+            channel="chromium",
+            headless=HEADLESS,
+            no_viewport=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        return None, None
+        page = ctx.new_page()
+        try:
+            # Solve the Turnstile challenge first (it's flaky, so retry), then
+            # fill credentials. This mirrors the sequence that reliably gets a
+            # token; touching the form fields first can disturb the widget.
+            if not _solve_turnstile(page, name):
+                return None, None, None
 
-    soup = BeautifulSoup(r.text, "lxml")
+            page.fill("#userID", username)
+            page.fill("#userPW", password)
 
-    meta = soup.find("meta", {"name": "csrf-token"})
-    csrf = meta["content"] if meta else None
+            # The form submits via AJAX; capture the login response for logging.
+            try:
+                with page.expect_response(
+                    lambda r: "/account/login" in r.url
+                    and r.request.method == "POST",
+                    timeout=60000,
+                ) as resp_info:
+                    page.click("button[type=submit]")
+                body = resp_info.value.text()
+                log.info("[%s] Login response: %s", name, body[:200])
+            except PWTimeout:
+                log.error("[%s] Login request never completed", name)
+                return None, None, None
 
-    points_el = soup.find("span", class_="myPoints")
-    log.info("[%s] Session valid (current points: %s)",
-             name, points_el.get_text(strip=True) if points_el else "?")
-    return soup, csrf
+            # Confirm authentication and grab the CSRF token.
+            page.goto(ACCOUNT_URL, wait_until="domcontentloaded", timeout=60000)
+            if "/account/login" in page.url:
+                log.error(
+                    "[%s] Login failed — check WARMANE_USERNAME_%s / "
+                    "WARMANE_PASSWORD_%s (or 2FA)",
+                    name, name, name,
+                )
+                return None, None, None
+
+            csrf = None
+            meta = page.query_selector("meta[name=csrf-token]")
+            if meta:
+                csrf = meta.get_attribute("content")
+
+            cookies = ctx.cookies()
+            page_html = page.content()
+            return cookies, csrf, page_html
+        finally:
+            ctx.close()
 
 
-def collect_for_account(name: str, cookie_str: str) -> bool:
-    session = make_session(cookie_str)
-    soup, csrf = get_account_page(session, name)
-    if soup is None:
+def collect_for_account(name: str, username: str, password: str) -> bool:
+    cookies, csrf, page_html = browser_login(name, username, password)
+    if cookies is None:
         return False
 
-    # Check if the collect link is present (hidden after already collecting today)
+    soup = BeautifulSoup(page_html, "lxml")
+
+    points_el = soup.find("span", class_="myPoints")
+    log.info("[%s] Logged in (current points: %s)",
+             name, points_el.get_text(strip=True) if points_el else "?")
+
     collect_link = soup.find("a", attrs={"data-click": "collectpoints"})
     if not collect_link:
         log.info("[%s] Points already collected today (collect link not present)", name)
         return True
 
-    # Mirror exactly what the browser JS does:
-    #   POST /account  data={collectpoints: true}  with CSRF token
+    # Carry the browser's authenticated session into requests for the collect POST.
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    for c in cookies:
+        session.cookies.set(
+            c["name"], c["value"],
+            domain=c["domain"].lstrip("."),
+            path=c.get("path", "/"),
+        )
+
     headers = {"X-Requested-With": "XMLHttpRequest", "Referer": ACCOUNT_URL}
     if csrf:
         headers["X-CSRF-TOKEN"] = csrf
@@ -96,7 +197,6 @@ def collect_for_account(name: str, cookie_str: str) -> bool:
         log.info("[%s] Points collected — new balance: %s", name, data["points"])
         return True
 
-    # Server may return error messages
     msgs = data.get("messages", {})
     errors = msgs.get("error", [])
     if errors:
@@ -107,15 +207,16 @@ def collect_for_account(name: str, cookie_str: str) -> bool:
     return False
 
 
-def get_accounts() -> list[tuple[str, str]]:
+def get_accounts() -> list[tuple[str, str, str]]:
     accounts = []
     i = 1
     while True:
-        label = os.environ.get(f"WARMANE_NAME_{i}", str(i)).strip()
-        cookie = os.environ.get(f"WARMANE_COOKIE_{i}", "").strip()
-        if not cookie:
+        username = os.environ.get(f"WARMANE_USERNAME_{i}", "").strip()
+        password = os.environ.get(f"WARMANE_PASSWORD_{i}", "").strip()
+        if not username or not password:
             break
-        accounts.append((label, cookie))
+        label = os.environ.get(f"WARMANE_NAME_{i}", username).strip()
+        accounts.append((label, username, password))
         i += 1
     return accounts
 
@@ -125,15 +226,21 @@ def collect():
     if not accounts:
         log.error(
             "No accounts configured. Add to .env:\n"
-            "  WARMANE_NAME_1=MyAccount\n"
-            "  WARMANE_COOKIE_1=<full Cookie header from browser DevTools>"
+            "  WARMANE_USERNAME_1=myusername\n"
+            "  WARMANE_PASSWORD_1=mypassword\n"
+            "  WARMANE_NAME_1=MyAccount  (optional label)"
         )
         sys.exit(1)
 
     log.info("Processing %d account(s)", len(accounts))
     failed = []
-    for name, cookie in accounts:
-        if not collect_for_account(name, cookie):
+    for name, username, password in accounts:
+        try:
+            ok = collect_for_account(name, username, password)
+        except Exception:
+            log.exception("[%s] Unexpected error during collection", name)
+            ok = False
+        if not ok:
             failed.append(name)
 
     if failed:

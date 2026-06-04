@@ -2,6 +2,8 @@
 
 Automatically collects daily coinage points on [Warmane](https://www.warmane.com) for up to 20 accounts. Runs in Docker on a daily cron schedule.
 
+The login form is protected by an interactive Cloudflare Turnstile challenge ("Verify you are human"). The collector logs in by driving a real Chromium browser (headed, under a virtual X display) via [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) — a patched Playwright that evades bot detection — clicking the Turnstile checkbox to obtain a token. It then collects points for each account using your username and password — no manual cookie copying required.
+
 ## Requirements
 
 - Docker + Docker Compose
@@ -15,19 +17,7 @@ git clone https://github.com/1rc1/warmane_points.git
 cd warmane_points
 ```
 
-### 2. Get your session cookie
-
-1. Open Chrome/Firefox and log into [warmane.com/account](https://www.warmane.com/account)
-2. Press **F12** → **Network** tab
-3. Click any request to `www.warmane.com` in the list
-4. In the right panel open **Request Headers**
-5. Find the `Cookie:` line and copy everything after `Cookie: `
-
-**For multiple accounts** — get each cookie without logging out:
-- Use a **private/incognito window** for the second account (separate session from your main browser)
-- Or use a second **browser profile** (each profile has its own independent session)
-
-### 3. Create your `.env` file
+### 2. Create your `.env` file
 
 ```bash
 cp .env.example .env
@@ -37,15 +27,17 @@ Edit `.env` and fill in your accounts:
 
 ```env
 WARMANE_NAME_1=MyAccount
-WARMANE_COOKIE_1=PHPSESSID=abc123...; other=value...
+WARMANE_USERNAME_1=myusername
+WARMANE_PASSWORD_1=mypassword
 
 WARMANE_NAME_2=AnotherAccount
-WARMANE_COOKIE_2=PHPSESSID=xyz456...; other=value...
+WARMANE_USERNAME_2=anotheruser
+WARMANE_PASSWORD_2=anotherpassword
 ```
 
-Supports up to 20 accounts — just keep adding numbered blocks.
+`WARMANE_NAME_N` is just a label for the logs (optional — defaults to the username). Supports up to 20 accounts; just keep adding numbered blocks.
 
-### 4. Start the container
+### 3. Start the container
 
 ```bash
 docker compose up -d --build
@@ -70,16 +62,17 @@ docker compose exec warmane-points python collect_points.py
 docker compose down
 ```
 
-## Cookie expiry
+## Optional tuning
 
-Cookies typically last several weeks. When one expires the script logs:
+These environment variables can be set in `.env`:
 
-```
-[AccountName] Cookie expired — log into warmane.com, open DevTools → Network → ...
-```
+- `WARMANE_TURNSTILE_TIMEOUT=45000` — how long (ms) to wait for Turnstile to issue its token after clicking the checkbox.
+- `WARMANE_HEADLESS=true` — run Chromium headless. **Not recommended** — Cloudflare typically refuses to issue a token to a headless browser. The default (headed, under the container's Xvfb display) is what works.
 
-Just repeat step 2 above and update the cookie in your `.env`, then restart:
+## Troubleshooting
 
-```bash
-docker compose restart
-```
+**`Login failed — check WARMANE_USERNAME_N / WARMANE_PASSWORD_N`**
+The credentials were rejected (or the account uses two-factor auth). Double-check the username and password in `.env`.
+
+**`Turnstile did not issue a token in time — the captcha challenge failed`**
+Cloudflare didn't hand over a token. This is usually about IP reputation — datacenter/VPS IPs get harsher challenges than home connections. Try increasing `WARMANE_TURNSTILE_TIMEOUT`, or run the container from a residential network.
